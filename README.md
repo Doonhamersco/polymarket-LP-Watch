@@ -6,6 +6,8 @@ LPWatch helps you farm **low-risk LP rewards** on Polymarket and avoid getting *
 - **LP monitor**: Watches your positions and **alerts in Telegram** when price gets close to your bids, so you can pull or adjust before getting filled.
 - **Telegram commands**: Manage positions from Telegram — `/positions`, `/out_of_range`, `/add_position`, `/edit_position`, `/bulk_add`, `/remove_position`.
 
+**Note:** The script is self-contained and does not read any files at runtime. You only need `best_lp_markets.py` (and optionally the example configs) to run it. `SKILL_UPDATED_1.md` is optional reference documentation for the risk methodology.
+
 ---
 
 ## Features

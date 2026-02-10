@@ -6,7 +6,7 @@ Fetches active Polymarket markets with LP rewards, scores them by risk
 (spike, time proximity, adverse selection), and displays the best markets
 where risk is minimal for farming LP rewards.
 
-Based on SKILL_UPDATED_1.md (Polymarket LP Rewards Analyzer).
+Based on lp.md (Polymarket LP Rewards Analyzer).
 """
 
 import json

@@ -1,0 +1,23 @@
+# Local config and data (may contain secrets)
+positions.json
+monitor_config.json
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Optional: uncomment if you add a skill file here
+# SKILL_UPDATED_1.md

@@ -111,7 +111,7 @@ On first run in mode 2 or 3 you’ll be prompted for positions (slug/URL, side, 
 
 ## Risk model
 
-Risk scoring and event classification (binary, scheduled, election/primary, gradual, asset_price) follow the **Polymarket LP Rewards Analyzer** methodology. Asset-price markets are excluded from low-risk recommendations. See `SKILL_UPDATED_1.md` in the repo (if you add it) or your local skill file for full detail.
+Risk scoring and event classification (binary, scheduled, election/primary, gradual, asset_price) follow the **Polymarket LP Rewards Analyzer** methodology. Asset-price markets are excluded from low-risk recommendations. See `SKILL_UPDATED_1.md` in the repo for full detail.
 
 ---
 

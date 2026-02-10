@@ -18,6 +18,3 @@ build/
 .DS_Store
 *.swp
 *.swo
-
-# Optional: uncomment if you add a skill file here
-# SKILL_UPDATED_1.md

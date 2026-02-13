@@ -22,7 +22,7 @@ LPWatch helps you farm **low-risk LP rewards** on Polymarket and avoid getting *
 
 ### LP position monitor (modes 2 & 3)
 
-- Watches your positions; alerts when **price nears your limit** (configurable threshold in cents).
+- Watches your positions; alerts when **price nears your limit** (default: 1.0¢, configurable).
 - Sorts by **riskiness**: smallest distance first, then fewest **bids before** (dollars of bids at or above your limit).
 - Shows **question**, side, current, limit, distance, and **bids before** per position.
 - Distance colors: ≤1¢ red, ≤2¢ amber, 2–4.9¢ green, **≥5¢ red + OUT OF RANGE**.
@@ -33,7 +33,8 @@ LPWatch helps you farm **low-risk LP rewards** on Polymarket and avoid getting *
 - Commands:
   - `/positions` — list all positions (same format as terminal, sorted by risk).
   - `/out_of_range` — list only positions with **distance ≥ 5¢** (quick way to update stale limits).
-  - `/add_position <SLUG|URL> <YES/NO> <PRICE>` — add one (duplicate same market+side is rejected; use `/edit_position` instead).
+  - `/market <SLUG|URL>` — show only the positions you hold in that specific market.
+  - `/add_position <SLUG|URL> <YES/NO> <PRICE>` — add or **update** a position; if a position with the same market+side already exists, its price is replaced.
   - `/edit_position <INDEX> <NEW_PRICE>` — change limit of existing position.
   - `/bulk_add` — next message: many lines `<SLUG|URL> <YES/NO> <PRICE>`.
   - `/remove_position <INDEX> [INDEX ...]` — remove one or several.
@@ -97,6 +98,9 @@ python3 best_lp_markets.py
 - **[1]** Scan low-risk LP markets only.
 - **[2]** Monitor my LP positions (load/save positions + Telegram config, then run monitor).
 - **[3]** Scan first, then monitor.
+- **[4]** Show my on-chain Polymarket positions by address (read-only, no private key).
+
+**Note:** When monitoring positions (modes 2/3), the script automatically checks for "Up or Down" markets (crypto or stock indices like SPX) starting within 1.5 hours and sends Telegram alerts when new opportunities appear. These markets offer massive rewards ($500–$1000 daily) with zero risk until the underlying market opens.
 
 On first run in mode 2 or 3 you’ll be prompted for positions (slug/URL, side, limit price) and Telegram token + chat_id; these are saved to `positions.json` and `monitor_config.json`. On later runs you can accept saved config and go straight to monitoring. See `positions.example.json` and `monitor_config.example.json` for the expected format (do not commit real tokens or private data).
 

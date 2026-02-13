@@ -16,12 +16,13 @@ import time
 import urllib.request
 import urllib.parse
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 
 # --- Constants ---
 GAMMA_BASE = "https://gamma-api.polymarket.com/markets"
+DATA_API_BASE = "https://data-api.polymarket.com/positions"
 PAGE_LIMIT = 100
 REQUEST_TIMEOUT = 30
 # Show markets with composite risk score at or below this (0–100; lower = safer)
@@ -143,6 +144,46 @@ def fetch_all_markets():
     return all_markets
 
 
+def fetch_user_positions(user_address: str, limit: int = 500) -> list[dict]:
+    """
+    Fetch current positions for a given Polymarket user/proxy wallet address
+    from the public Data API.
+
+    Read-only: requires only the public address (no private key or auth).
+    """
+    all_positions: list[dict] = []
+    offset = 0
+    while True:
+        try:
+            params = {
+                "user": user_address,
+                "sizeThreshold": 0,
+                "limit": limit,
+                "offset": offset,
+            }
+            query = urllib.parse.urlencode(params)
+            url = f"{DATA_API_BASE}?{query}"
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "LPScan/1.0 (LP rewards analyzer)"},
+            )
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                chunk = json.loads(resp.read().decode())
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"Data API error at offset {offset}: {e}", file=sys.stderr)
+            break
+        if not chunk:
+            break
+        if not isinstance(chunk, list):
+            print("Unexpected positions response format from Data API.", file=sys.stderr)
+            break
+        all_positions.extend(chunk)
+        if len(chunk) < limit:
+            break
+        offset += limit
+    return all_positions
+
+
 def normalize_market_slug(slug: str) -> str:
     """Normalize user input into a Polymarket market slug.
 
@@ -202,6 +243,71 @@ def fetch_orderbook(token_id: str) -> Optional[dict]:
     except Exception as e:
         print(f"Failed to fetch orderbook for token {token_id}: {e}", file=sys.stderr)
         return None
+
+
+def show_user_positions_read_only() -> None:
+    """
+    Prompt for a Polymarket user/proxy wallet address and display current positions
+    from the public Data API. This is read-only and does not require a private key.
+    """
+    print()
+    print("Read-only Polymarket positions (via Data API)")
+    addr = input("Enter your Polymarket user/proxy wallet address (0x...): ").strip()
+    if not addr:
+        print("No address entered; skipping.")
+        return
+
+    print()
+    print(f"Fetching current positions for {addr} ...")
+    positions = fetch_user_positions(addr)
+    if not positions:
+        print("No open positions returned by the Data API for this address.")
+        return
+
+    print(f"Found {len(positions)} position(s).")
+    print()
+    sep = "-" * 100
+    for idx, p in enumerate(positions, 1):
+        title = p.get("title") or "(untitled market)"
+        outcome = p.get("outcome") or "N/A"
+        size = float(p.get("size", 0) or 0)
+        avg_price = float(p.get("avgPrice", 0) or 0)
+        cur_price = float(p.get("curPrice", 0) or 0)
+        cash_pnl = float(p.get("cashPnl", 0) or 0)
+        pct_pnl = float(p.get("percentPnl", 0) or 0)
+        slug = p.get("slug") or ""
+        event_slug = p.get("eventSlug") or ""
+        if event_slug and slug:
+            url = f"https://polymarket.com/event/{event_slug}/{slug}"
+        elif slug:
+            url = f"https://polymarket.com/event/{slug}"
+        else:
+            url = ""
+
+        if len(title) > 120:
+            title = title[:117] + "..."
+        if USE_COLOR:
+            title_out = color_text(title, BOLD)
+        else:
+            title_out = title
+
+        print(sep)
+        print(f"{idx}. {title_out}")
+        print(
+            f"   Outcome: {outcome}  "
+            f"Size: {size:.4f}  "
+            f"Avg price: {avg_price:.4f}  "
+            f"Current price: {cur_price:.4f}"
+        )
+        print(
+            f"   PnL: ${cash_pnl:,.2f}  "
+            f"Percent PnL: {pct_pnl:.2f}%"
+        )
+        if url:
+            url_str = color_text(url, CYAN) if USE_COLOR else url
+            print(f"   {url_str}")
+        print()
+    print(sep)
 
 
 def filter_reward_markets(markets):
@@ -392,6 +498,79 @@ def format_end_date(end_date_str) -> str:
         return end_date.strftime("%B %d, %Y")
     except Exception:
         return "unknown"
+
+
+def is_crypto_up_down_market(question: str) -> bool:
+    """Check if market is a crypto or stock index 'Up or Down' price prediction market."""
+    q = (question or "").lower()
+    asset_keywords = [
+        "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "crypto",
+        "spx", "s&p", "sp500", "s&p 500", "nasdaq", "dow", "stock"
+    ]
+    up_down_patterns = ["up or down", "up/down", "up or down market"]
+    return any(asset in q for asset in asset_keywords) and any(pattern in q for pattern in up_down_patterns)
+
+
+def parse_time_period_from_question(question: str) -> Optional[tuple[datetime, datetime]]:
+    """
+    Parse time period from question text like:
+    'Bitcoin Up or Down - February 13, 12:00PM-12:05PM ET'
+    Returns (start_time, end_time) in UTC, or None if can't parse.
+    """
+    if not question:
+        return None
+    
+    # Look for patterns like "February 13, 12:00PM-12:05PM ET" or "Feb 13, 12:00PM-4:00PM ET"
+    # Try to extract date and time range
+    import re
+    
+    # Pattern: Month Day, HH:MMAM/PM-HH:MMAM/PM ET
+    pattern = r"([A-Za-z]+)\s+(\d{1,2}),\s+(\d{1,2}):(\d{2})(AM|PM)\s*-\s*(\d{1,2}):(\d{2})(AM|PM)\s*(ET|EST|EDT)"
+    match = re.search(pattern, question, re.IGNORECASE)
+    if not match:
+        return None
+    
+    try:
+        month_name, day, start_hour, start_min, start_ampm, end_hour, end_min, end_ampm, tz = match.groups()
+        
+        # Get current year (assume same year unless it's past December and we're in January)
+        now = datetime.now(timezone.utc)
+        year = now.year
+        
+        # Convert month name to number
+        month_map = {
+            "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+            "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
+        }
+        month = month_map.get(month_name.lower())
+        if not month:
+            return None
+        
+        # Convert to 24-hour format
+        start_hour_int = int(start_hour)
+        if start_ampm.upper() == "PM" and start_hour_int != 12:
+            start_hour_int += 12
+        elif start_ampm.upper() == "AM" and start_hour_int == 12:
+            start_hour_int = 0
+        
+        end_hour_int = int(end_hour)
+        if end_ampm.upper() == "PM" and end_hour_int != 12:
+            end_hour_int += 12
+        elif end_ampm.upper() == "AM" and end_hour_int == 12:
+            end_hour_int = 0
+        
+        # ET is UTC-5 (EST) or UTC-4 (EDT) - use UTC-4 for simplicity (EDT)
+        # Create naive datetime objects (assume ET timezone)
+        start_naive = datetime(year, month, int(day), start_hour_int, int(start_min))
+        end_naive = datetime(year, month, int(day), end_hour_int, int(end_min))
+        
+        # Convert ET to UTC (ET = UTC-4, so add 4 hours)
+        start_dt = (start_naive + timedelta(hours=4)).replace(tzinfo=timezone.utc)
+        end_dt = (end_naive + timedelta(hours=4)).replace(tzinfo=timezone.utc)
+        
+        return start_dt, end_dt
+    except Exception:
+        return None
 
 
 def format_reasoning(row: dict) -> str:
@@ -598,11 +777,11 @@ def parse_bulk_positions(
     Parse bulk positions from multi-line text.
     Each non-empty line should be:
       <slug-or-url> <YES/NO> <price>
-    Returns (added_count, skipped_malformed, skipped_duplicates).
+    Returns (added_count, skipped_malformed, updated_count).
     """
     added = 0
     skipped = 0
-    dupes = 0
+    updated = 0
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
@@ -621,18 +800,19 @@ def parse_bulk_positions(
         if side not in {"YES", "NO"}:
             skipped += 1
             continue
-        # Avoid duplicate per (market_slug, side)
+        # Update existing position if found, otherwise add new
         existing_idx = find_position_index(positions, slug, side)
         if existing_idx is not None:
-            dupes += 1
-            continue
-        positions.append(
-            Position(market_slug=slug, side=side, my_limit_price=price, notes="")
-        )
-        added += 1
-    if added:
+            positions[existing_idx].my_limit_price = price
+            updated += 1
+        else:
+            positions.append(
+                Position(market_slug=slug, side=side, my_limit_price=price, notes="")
+            )
+            added += 1
+    if added or updated:
         save_positions(positions)
-    return added, skipped, dupes
+    return added, skipped, updated
 
 
 def prompt_for_positions() -> list[Position]:
@@ -694,6 +874,46 @@ def get_positions_with_persistence() -> list[Position]:
         print(f"Found {len(positions)} saved positions in {POSITIONS_PATH.name}.")
         use_saved = input("Use these saved positions? [Y/n]: ").strip().lower() or "y"
         if use_saved == "y":
+            # Show current positions with indices so the user can clean them up
+            print()
+            print("Current saved positions:")
+            for idx, p in enumerate(positions, 1):
+                print(f"  {idx}. {p.side} @ {p.my_limit_price:.3f} on {p.market_slug}")
+            print()
+            to_remove = (
+                input(
+                    "Enter indices to remove (space-separated), or press Enter to keep all: "
+                )
+                .strip()
+            )
+            if to_remove:
+                try:
+                    idx_values = sorted(
+                        {
+                            int(tok)
+                            for tok in to_remove.split()
+                            if tok.strip()
+                        },
+                        reverse=True,
+                    )
+                except ValueError:
+                    print("Invalid indices entered; skipping removal step.")
+                else:
+                    max_idx = len(positions)
+                    removed_any = False
+                    for i in idx_values:
+                        if 1 <= i <= max_idx:
+                            removed = positions.pop(i - 1)
+                            print(
+                                f"  Removed {i}. {removed.side} @ {removed.my_limit_price:.3f} on {removed.market_slug}"
+                            )
+                            removed_any = True
+                        else:
+                            print(f"  Index {i} out of range; ignoring.")
+                    if removed_any:
+                        print()
+                        print(f"{len(positions)} position(s) remain after removal.")
+
             add_more = input("Add more positions now? [y/N]: ").strip().lower() or "n"
             if add_more == "y":
                 extra = prompt_for_positions()
@@ -764,7 +984,7 @@ def get_monitor_config_with_persistence() -> tuple[Optional[TelegramBot], int, f
             bot = TelegramBot(token=token, chat_id=chat_id) if token and chat_id else None
             settings = config.get("settings", {}) or {}
             poll_interval = int(settings.get("poll_interval_seconds", 30))
-            price_thresh = float(settings.get("price_alert_threshold_cents", 2.0))
+            price_thresh = float(settings.get("price_alert_threshold_cents", 1.0))
             return bot, poll_interval, price_thresh
         else:
             print("Discarding saved monitor config for this run; enter new settings.")
@@ -777,10 +997,10 @@ def get_monitor_config_with_persistence() -> tuple[Optional[TelegramBot], int, f
     except ValueError:
         poll_interval = 30
     try:
-        thresh_str = input("Price alert threshold in cents [default 2]: ").strip()
-        price_thresh = float(thresh_str) if thresh_str else 2.0
+        thresh_str = input("Price alert threshold in cents [default 1]: ").strip()
+        price_thresh = float(thresh_str) if thresh_str else 1.0
     except ValueError:
-        price_thresh = 2.0
+        price_thresh = 1.0
 
     # Save for next time
     cfg = {
@@ -805,6 +1025,8 @@ def process_telegram_commands(
 
     Supported commands:
     - /positions
+    - /out_of_range
+    - /market <slug-or-url>
     - /add_position <slug> <YES/NO> <limit_price> [notes...]
     - /remove_position <index>
     - /help
@@ -834,13 +1056,13 @@ def process_telegram_commands(
         # If we're expecting bulk input from this chat, treat the next non-command
         # text message as bulk positions payload.
         if BULK_INPUT_PENDING.get(chat_id) and text and not text.startswith("/"):
-            added, skipped, dupes = parse_bulk_positions(text, positions)
+            added, skipped, updated = parse_bulk_positions(text, positions)
             BULK_INPUT_PENDING.pop(chat_id, None)
             msg = f"Bulk add complete. Added {added} position(s)"
+            if updated:
+                msg += f", updated {updated} existing position(s)"
             if skipped:
                 msg += f", skipped {skipped} malformed line(s)"
-            if dupes:
-                msg += f", skipped {dupes} duplicate position(s)"
             msg += "."
             bot.send_message(msg)
             continue
@@ -1063,6 +1285,114 @@ def process_telegram_commands(
                     for chunk in chunks:
                         bot.send_message(chunk, parse_mode="HTML")
 
+        elif cmd == "/market" and len(parts) >= 2:
+            """Show positions for a specific market (by slug or URL)."""
+            if not positions:
+                bot.send_message("No positions saved.")
+            else:
+                target = normalize_market_slug(parts[1])
+                rows: list[dict] = []
+                orderbook_cache: dict[str, Optional[dict]] = {}
+                for idx, p in enumerate(positions, 1):
+                    if normalize_market_slug(p.market_slug) != target:
+                        continue
+                    market = fetch_market_by_slug(p.market_slug)
+                    if not market:
+                        continue
+                    yes_price, no_price = get_current_prices(market)
+                    current_price = yes_price if p.side == "YES" else no_price
+                    distance_cents = abs(current_price - p.my_limit_price) * 100
+                    yes_token_id, no_token_id = parse_token_ids(market)
+                    token_id = yes_token_id if p.side == "YES" else no_token_id
+                    bids_dollars_before = 0.0
+                    if token_id:
+                        if token_id not in orderbook_cache:
+                            orderbook_cache[token_id] = fetch_orderbook(token_id)
+                        ob = orderbook_cache.get(token_id) or {}
+                        bids = ob.get("bids", []) or []
+                        for b in bids:
+                            try:
+                                price = float(b.get("price", 0))
+                                size = float(
+                                    b.get("quantity")
+                                    or b.get("size")
+                                    or b.get("remaining")
+                                    or 0
+                                )
+                            except Exception:
+                                continue
+                            if price >= p.my_limit_price:
+                                bids_dollars_before += price * size
+                    rows.append(
+                        {
+                            "idx": idx,
+                            "question": market.get("question") or p.market_slug,
+                            "side": p.side,
+                            "current_price": current_price,
+                            "limit_price": p.my_limit_price,
+                            "distance_cents": distance_cents,
+                            "bids_before": bids_dollars_before,
+                        }
+                    )
+
+                if not rows:
+                    bot.send_message(
+                        "No positions found for that market. "
+                        "Make sure you used the slug or URL of a market you have saved."
+                    )
+                else:
+                    rows.sort(
+                        key=lambda r: (
+                            r["distance_cents"],
+                            r["bids_before"],
+                        )
+                    )
+                    # Use the first row's question as market title
+                    title = rows[0]["question"]
+                    if len(title) > 120:
+                        title = title[:117] + "..."
+                    header = (
+                        "<b>Positions for market</b>\n"
+                        f"{title}\n"
+                        "(sorted by risk — closest & thinnest first):"
+                    )
+                    current_block = header
+                    chunks: list[str] = []
+                    for r in rows:
+                        idx = r["idx"]
+                        q = r["question"]
+                        if len(q) > 120:
+                            q = q[:117] + "..."
+                        cp = r["current_price"]
+                        lp = r["limit_price"]
+                        dist = r["distance_cents"]
+                        bids = r["bids_before"]
+                        if dist <= 1.0:
+                            dist_str = f"{dist:.1f}¢"
+                        elif dist <= 2.0:
+                            dist_str = f"{dist:.1f}¢"
+                        elif dist >= 5.0:
+                            dist_str = f"{dist:.1f}¢ OUT OF RANGE"
+                        else:
+                            dist_str = f"{dist:.1f}¢"
+                        line = (
+                            f"\n\n<b>{idx}. {q}</b>\n"
+                            f"Side: <b>{r['side']}</b> • "
+                            f"Current: <b>{cp:.3f}</b> • "
+                            f"Limit: <b>{lp:.3f}</b> • "
+                            f"Distance: <b>{dist_str}</b> • "
+                            f"Bids before: <b>${bids:,.2f}</b>"
+                        )
+                        if len(current_block) + len(line) > 3500:
+                            chunks.append(current_block)
+                            current_block = header + line
+                        else:
+                            current_block += line
+                    if current_block:
+                        chunks.append(current_block)
+                    for chunk in chunks:
+                        bot.send_message(chunk, parse_mode="HTML")
+
         elif cmd == "/add_position" and len(parts) >= 4:
             slug = parts[1]
             side = parts[2].upper()
@@ -1076,23 +1406,27 @@ def process_telegram_commands(
                 continue
             existing_idx = find_position_index(positions, slug, side)
             if existing_idx is not None:
-                existing = positions[existing_idx]
+                p = positions[existing_idx]
+                old_price = p.my_limit_price
+                p.my_limit_price = limit_price
+                save_positions(positions)
                 bot.send_message(
-                    "You are already positioned on this market/side — duplicate ignored.\n"
-                    f"Existing: {existing.side} @ {existing.my_limit_price:.3f} on {existing.market_slug}\n\n"
-                    "Use /edit_position <index> <new_price> after /positions to change it."
+                    "Updated existing position on this market/side.\n"
+                    f"{p.side} on {p.market_slug}\n"
+                    f"Old price: {old_price:.3f}\n"
+                    f"New price: {limit_price:.3f}"
                 )
-                continue
-            positions.append(
-                Position(
-                    market_slug=slug,
-                    side=side,
-                    my_limit_price=limit_price,
-                    notes="",
+            else:
+                positions.append(
+                    Position(
+                        market_slug=slug,
+                        side=side,
+                        my_limit_price=limit_price,
+                        notes="",
+                    )
                 )
-            )
-            save_positions(positions)
-            bot.send_message(f"Added position: {side} @ {limit_price:.3f} on {slug}")
+                save_positions(positions)
+                bot.send_message(f"Added position: {side} @ {limit_price:.3f} on {slug}")
 
         elif cmd == "/edit_position" and len(parts) >= 3:
             try:
@@ -1181,6 +1515,7 @@ def process_telegram_commands(
                 "Commands:\n"
                 "/positions — list current positions\n"
                 "/out_of_range — list only OUT OF RANGE positions (distance ≥ 5¢)\n"
+                "/market <slug-or-url> — show only positions for a specific market\n"
                 "/add_position <slug> <YES/NO> <price> [notes]\n"
                 "/edit_position <index> <new_price> — edit price of an existing position\n"
                 "/bulk_add — add many positions; next message: one '<slug> <YES/NO> <price>' per line\n"
@@ -1190,11 +1525,73 @@ def process_telegram_commands(
     return last_update_id
 
 
+def check_crypto_up_down_markets(
+    bot: Optional[TelegramBot],
+    alerted_markets: set[str],
+) -> None:
+    """Check for new Up/Down markets (crypto or stock indices) starting within 1.5 hours and send Telegram alerts."""
+    if bot is None:
+        return
+    
+    try:
+        reward_markets = filter_reward_markets(fetch_all_markets())
+        now = datetime.now(timezone.utc)
+        
+        new_markets = []
+        for m in reward_markets:
+            question = m.get("question", "")
+            if not is_crypto_up_down_market(question):
+                continue
+            
+            slug = m.get("slug", "")
+            if slug in alerted_markets:
+                continue
+            
+            time_period = parse_time_period_from_question(question)
+            if not time_period:
+                continue
+            
+            start_time, end_time = time_period
+            hours_until_start = (start_time - now).total_seconds() / 3600
+            
+            # Only alert if market starts within 1.5 hours (and hasn't started yet)
+            if hours_until_start > 1.5 or hours_until_start < 0:
+                continue
+            
+            row = build_market_row(m)
+            if row:
+                new_markets.append({
+                    "slug": slug,
+                    "question": question,
+                    "start_time": start_time,
+                    "hours_until_start": hours_until_start,
+                    "daily_rewards": row["daily_rewards"],
+                    "url": row["url"],
+                })
+        
+        # Alert on new markets
+        for market in new_markets:
+            alerted_markets.add(market["slug"])
+            start_str = market["start_time"].strftime("%Y-%m-%d %H:%M UTC")
+            msg = (
+                "🚀 <b>UP/DOWN MARKET OPPORTUNITY</b>\n\n"
+                f"<b>{market['question']}</b>\n\n"
+                f"• Start: <b>{start_str}</b> ({market['hours_until_start']:.1f} hours from now)\n"
+                f"• Daily rewards: <b>${market['daily_rewards']:.2f}</b>\n"
+                f"• <b>Zero risk until market opens</b> (price cannot move when closed)\n\n"
+                f"<a href='{market['url']}'>View market</a>"
+            )
+            bot.send_message(msg)
+            print(f"  >> Alerted on Up/Down market: {market['question'][:60]}...")
+    except Exception as e:
+        print(f"  Error checking crypto Up/Down markets: {e}", file=sys.stderr)
+
+
 def run_position_monitor(
     positions: list[Position],
     bot: Optional[TelegramBot],
     poll_interval_seconds: int = 30,
-    price_alert_threshold_cents: float = 2.0,
+    price_alert_threshold_cents: float = 1.0,
 ) -> None:
     """Continuously monitor positions and send alerts when price nears limit."""
     if not positions:
@@ -1203,13 +1600,15 @@ def run_position_monitor(
 
     last_alert_price: dict[tuple[str, str], float] = {}
     last_update_id: Optional[int] = None
+    alerted_crypto_markets: set[str] = set()
+    iteration_count = 0
     print()
     print("Starting position monitor. Ctrl+C to stop.")
     # Cache orderbooks per token_id within a single loop to avoid spamming API
     while True:
         orderbook_cache: dict[str, Optional[dict]] = {}
         rows: list[dict] = []
-        for pos in positions:
+        for idx, pos in enumerate(positions, 1):
             market = fetch_market_by_slug(pos.market_slug)
             if not market:
                 print(f"  Could not fetch market for slug '{pos.market_slug}'.")
@@ -1249,6 +1648,7 @@ def run_position_monitor(
             url = f"https://polymarket.com/event/{event_slug}/{market_slug}" if event_slug else f"https://polymarket.com/event/{market_slug}"
             rows.append(
                 {
+                    "idx": idx,
                     "url": url,
                     "question": market.get("question") or url,
                     "side": pos.side,
@@ -1271,7 +1671,7 @@ def run_position_monitor(
                 question = (market.get("question") or pos.market_slug)[:80]
                 msg = (
                     "🚨 <b>PRICE ALERT</b>\n\n"
-                    f"<b>{question}</b>\n\n"
+                    f"<b>{idx}. {question}</b>\n\n"
                     f"Price {direction} your limit on <b>{pos.side}</b>.\n"
                     f"• Current: <b>{current_price:.3f}</b>\n"
                     f"• Your limit: <b>{pos.my_limit_price:.3f}</b>\n"
@@ -1292,6 +1692,7 @@ def run_position_monitor(
             )
             print()
             for r in rows:
+                idx = r["idx"]
                 dist = r["distance_cents"]
                 # Color coding:
                 # - <=1¢: red (very close)
@@ -1313,7 +1714,7 @@ def run_position_monitor(
                 if USE_COLOR:
                     title = color_text(title, BOLD)
                 print(
-                    f"{title} — {r['side']} "
+                    f"{idx}. {title} — {r['side']} "
                     f"current: {r['current_price']:.3f}, "
                     f"limit: {r['limit_price']:.3f}, "
                     f"distance: {dist_str}, "
@@ -1321,6 +1722,12 @@ def run_position_monitor(
                 )
         # Handle Telegram commands (positions management)
         last_update_id = process_telegram_commands(bot, positions, last_update_id)
+        
+        # Check for crypto Up/Down markets every 10 iterations (~5 minutes)
+        iteration_count += 1
+        if iteration_count % 10 == 0:
+            check_crypto_up_down_markets(bot, alerted_crypto_markets)
+        
         print()
         print(f"Sleeping {poll_interval_seconds} seconds before next check...")
         try:
@@ -1337,10 +1744,12 @@ def main():
     print("  [1] Scan low-risk LP markets")
     print("  [2] Monitor my LP positions (price alerts)")
     print("  [3] Scan markets, then monitor positions")
-    mode = input("Choose mode [1/2/3] (default 1): ").strip() or "1"
+    print("  [4] Show my Polymarket positions by address (read-only, no private key)")
+    mode = input("Choose mode [1/2/3/4] (default 1): ").strip() or "1"
 
     run_scan = mode in {"1", "3"}
     run_monitor = mode in {"2", "3"}
+    show_positions = mode == "4"
 
     if run_scan:
         print()
@@ -1358,11 +1767,13 @@ def main():
                 if row is not None:
                     rows.append(row)
             # Exclude asset-price markets (commodity, crypto, stock) — one pump can change things a lot
+            # Also require minimum total volume of $25,000 USD
             low_risk = [
                 r
                 for r in rows
                 if r["risk_composite"] <= MAX_RISK_FOR_DISPLAY
                 and r.get("event_category") != "asset_price"
+                and r.get("volume", 0) >= 25000
             ]
             low_risk.sort(key=lambda r: (-r["capital_efficiency"], r["risk_composite"]))
             top = low_risk[:TOP_N]
@@ -1416,6 +1827,8 @@ def main():
             poll_interval_seconds=poll_interval,
             price_alert_threshold_cents=price_thresh,
         )
+    elif show_positions:
+        show_user_positions_read_only()
 
 
 if __name__ == "__main__":

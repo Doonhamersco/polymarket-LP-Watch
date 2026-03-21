@@ -22,9 +22,14 @@ from typing import Optional
 
 # --- Constants ---
 GAMMA_BASE = "https://gamma-api.polymarket.com/markets"
+GAMMA_EVENTS_BASE = "https://gamma-api.polymarket.com/events"
 DATA_API_BASE = "https://data-api.polymarket.com/positions"
 PAGE_LIMIT = 100
 REQUEST_TIMEOUT = 30
+# Gamma "series" id for NCAA men's CBB (see GET /sports — sport "cbb", series "10470" / ncaa-cbb)
+CBB_SERIES_ID = 10470
+# Terminal/Telegram: show bids-before in red when below this USD (in addition to min_bid_depth alert)
+BIDS_BEFORE_DISPLAY_RED_USD = 1_200_000.0
 # Show markets with composite risk score at or below this (0–100; lower = safer)
 MAX_RISK_FOR_DISPLAY = 35
 # Max number of "best" low-risk markets to show
@@ -43,6 +48,7 @@ GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 CYAN = "\033[36m"
+ORANGE = "\033[38;5;208m"  # 256-color orange (sports countdown 4–7h)
 USE_COLOR = sys.stdout.isatty()
 
 
@@ -51,6 +57,117 @@ def color_text(text: str, color: str) -> str:
     if not USE_COLOR:
         return text
     return f"{color}{text}{RESET}"
+
+
+def parse_iso_datetime_to_utc(value: object) -> Optional[datetime]:
+    """Parse Polymarket/Gamma date strings to timezone-aware UTC."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s.replace("Z", "+00:00")
+    elif " " in s and "T" not in s[:20]:
+        s = s.replace(" ", "T", 1)
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt
+
+
+def parse_market_game_start_utc(market: dict) -> Optional[datetime]:
+    """
+    Best-effort game / event start for sports markets from Gamma API.
+    Uses gameStartTime, nested event startTime, then endDate (often tip-off for CBB).
+    """
+    gst = market.get("gameStartTime")
+    if gst:
+        dt = parse_iso_datetime_to_utc(gst)
+        if dt is not None:
+            return dt
+    events = market.get("events") or []
+    if isinstance(events, list) and events:
+        ev = events[0] or {}
+        for key in ("startTime", "endDate"):
+            dt = parse_iso_datetime_to_utc(ev.get(key))
+            if dt is not None:
+                return dt
+    return parse_iso_datetime_to_utc(market.get("endDate"))
+
+
+def format_game_countdown_colored(
+    game_start: Optional[datetime], now_utc: datetime
+) -> str:
+    """
+    Human-readable countdown with color:
+    - Red: game started or &lt; 4 hours until start (exit window)
+    - Orange: 4–7 hours until start
+    - Green: 7+ hours until start
+    """
+    if game_start is None:
+        return color_text("game: time unknown", CYAN)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    delta = game_start - now_utc
+    sec = delta.total_seconds()
+    if sec <= 0:
+        return color_text("GAME STARTED", RED)
+    hours = sec / 3600.0
+    h_int = int(sec // 3600)
+    m_int = int((sec % 3600) // 60)
+    if h_int >= 1:
+        label = f"{h_int} HOURS UNTIL GAME" if m_int == 0 else f"{h_int}h {m_int}m UNTIL GAME"
+    else:
+        label = f"{m_int} MIN UNTIL GAME" if m_int > 0 else "SOON"
+    if hours < 4.0:
+        return color_text(label, RED)
+    if hours < 7.0:
+        return color_text(label, ORANGE)
+    return color_text(label, GREEN)
+
+
+def format_bids_before_terminal(bb: float, min_alert_usd: float) -> str:
+    """Color bids-before: red below $1.2M; ⚠ when also below min alert threshold."""
+    if bb < min_alert_usd:
+        return color_text(f"${bb:,.2f} ⚠", RED)
+    if bb < BIDS_BEFORE_DISPLAY_RED_USD:
+        return color_text(f"${bb:,.2f}", RED)
+    return f"${bb:,.2f}"
+
+
+def format_bids_before_telegram_html(bids: float) -> str:
+    """Telegram HTML for bids before; flag when below $1.2M (no ANSI red in Telegram)."""
+    s = f"<b>${bids:,.2f}</b>"
+    if bids < BIDS_BEFORE_DISPLAY_RED_USD:
+        return s + " ⚠️"
+    return s
+
+
+def position_row_sort_key(row: dict, now_utc: datetime) -> tuple:
+    """
+    Sort rows for display: soonest upcoming game first, then distance, then bids_before.
+    Unknown game times last; games already started group after upcoming.
+    """
+    gs = row.get("game_start")
+    dist = row.get("distance_cents")
+    d = dist if dist is not None else 1e9
+    bids = row.get("bids_before")
+    b = bids if bids is not None else 1e9
+    if gs is None:
+        return (1e18, d, b)
+    g = gs if gs.tzinfo else gs.replace(tzinfo=timezone.utc)
+    if now_utc.tzinfo is None:
+        now_utc = now_utc.replace(tzinfo=timezone.utc)
+    sec_until = (g - now_utc).total_seconds()
+    if sec_until < 0:
+        return (1e17, sec_until, d, b)
+    return (sec_until, d, b)
 
 
 # =============================================================================
@@ -115,8 +232,11 @@ class TelegramBot:
             return []
 
 
-def fetch_all_markets():
-    """Fetch all active, non-closed markets with pagination."""
+def fetch_all_markets(*, quiet: bool = False):
+    """Fetch all active, non-closed markets with pagination.
+
+    When ``quiet`` is True, progress lines are not printed (for callers that want a silent fetch).
+    """
     all_markets = []
     offset = 0
     while True:
@@ -140,8 +260,85 @@ def fetch_all_markets():
         if len(markets) < PAGE_LIMIT:
             break
         offset += PAGE_LIMIT
-        print(f"  Fetched {len(all_markets)} markets...", flush=True)
+        if not quiet:
+            print(f"  Fetched {len(all_markets)} markets...", flush=True)
     return all_markets
+
+
+def outcome_to_yes_no_for_market(
+    market: dict, outcome_label: str, raw_position: dict
+) -> str:
+    """Map Data API outcome to YES/NO for this market's token pair."""
+    oi = raw_position.get("outcomeIndex")
+    if oi is not None:
+        try:
+            return "YES" if int(oi) == 0 else "NO"
+        except (TypeError, ValueError):
+            pass
+    outcomes = market.get("outcomes")
+    if isinstance(outcomes, str):
+        try:
+            outcomes = json.loads(outcomes.replace("'", '"'))
+        except Exception:
+            outcomes = []
+    if not outcomes or len(outcomes) < 2:
+        ol = (outcome_label or "").strip().lower()
+        if ol in ("no", "n"):
+            return "NO"
+        return "YES"
+    o0 = str(outcomes[0]).strip()
+    o1 = str(outcomes[1]).strip()
+    on = (outcome_label or "").strip()
+    if on.lower() == o0.lower():
+        return "YES"
+    if on.lower() == o1.lower():
+        return "NO"
+    if on.lower() in (o0.lower(), "yes", "y"):
+        return "YES"
+    if on.lower() in (o1.lower(), "no", "n"):
+        return "NO"
+    return "YES"
+
+
+def positions_from_wallet_data_api(user_address: str) -> list[Position]:
+    """
+    Build monitor positions from Polymarket Data API (on-chain holdings).
+
+    When you sell/close, the position disappears on the next refresh — no manual remove.
+
+    Limitation: **unfilled LP limit orders do not appear** here (only filled holdings).
+    For resting bids, keep using positions.json + Telegram or future CLOB order sync.
+    """
+    raw = fetch_user_positions(user_address)
+    out: list[Position] = []
+    for p in raw:
+        slug = (p.get("slug") or "").strip()
+        if not slug:
+            continue
+        try:
+            size = float(p.get("size", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if size <= 0:
+            continue
+        market = fetch_market_by_slug(slug)
+        if not market:
+            continue
+        side = outcome_to_yes_no_for_market(market, p.get("outcome") or "", p)
+        ap = float(p.get("avgPrice", 0) or 0)
+        cp = float(p.get("curPrice", 0) or 0)
+        ref = ap if ap > 0 else cp
+        if ref <= 0:
+            ref = 0.01
+        out.append(
+            Position(
+                market_slug=slug,
+                side=side,
+                my_limit_price=ref,
+                notes="wallet_sync",
+            )
+        )
+    return out
 
 
 def fetch_user_positions(user_address: str, limit: int = 500) -> list[dict]:
@@ -226,6 +423,108 @@ def fetch_market_by_slug(slug: str) -> Optional[dict]:
     except Exception as e:
         print(f"Failed to fetch market by slug '{slug}': {e}", file=sys.stderr)
         return None
+
+
+def fetch_event_markets(event_slug: str) -> list[dict]:
+    """Fetch all sub-markets for a Polymarket event slug via the Gamma events API."""
+    try:
+        norm_slug = normalize_market_slug(event_slug)
+        query = urllib.parse.urlencode({"slug": norm_slug})
+        url = f"https://gamma-api.polymarket.com/events?{query}"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "LPScan/1.0 (LP rewards analyzer)"},
+        )
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            events = json.loads(resp.read().decode())
+        if not events:
+            return []
+        return events[0].get("markets", []) or []
+    except Exception as e:
+        print(f"Failed to fetch event markets for '{event_slug}': {e}", file=sys.stderr)
+        return []
+
+
+def fetch_active_event_slugs_for_series(series_id: int) -> list[str]:
+    """Paginate Gamma /events for a series; return unique event slugs (e.g. all active CBB games)."""
+    slugs: list[str] = []
+    seen: set[str] = set()
+    offset = 0
+    while True:
+        try:
+            params = urllib.parse.urlencode(
+                {
+                    "series_id": series_id,
+                    "active": "true",
+                    "closed": "false",
+                    "limit": PAGE_LIMIT,
+                    "offset": offset,
+                }
+            )
+            url = f"{GAMMA_EVENTS_BASE}?{params}"
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "LPScan/1.0 (LP rewards analyzer)"},
+            )
+            with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+                events = json.loads(resp.read().decode())
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"API error fetching events at offset {offset}: {e}", file=sys.stderr)
+            break
+        if not events:
+            break
+        for e in events:
+            s = (e.get("slug") or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                slugs.append(s)
+        if len(events) < PAGE_LIMIT:
+            break
+        offset += PAGE_LIMIT
+    return slugs
+
+
+def export_ncaa_cbb_market_slugs(
+    out_tsv: Optional[Path] = None,
+    out_slugs: Optional[Path] = None,
+    series_id: int = CBB_SERIES_ID,
+) -> None:
+    """
+    Fetch every active NCAA CBB game in the Gamma series, then each game's sub-markets
+    (moneyline, spreads, totals, …) via /events?slug=… — same data as /list_event per game.
+    Writes a TSV and a plain slug list for bulk_add / Telegram.
+    """
+    out_tsv = out_tsv or Path(__file__).with_name("cbb_markets_export.tsv")
+    out_slugs = out_slugs or Path(__file__).with_name("cbb_market_slugs.txt")
+    print()
+    print("Fetching active NCAA CBB event slugs (Gamma series_id=%s)..." % series_id)
+    event_slugs = fetch_active_event_slugs_for_series(series_id)
+    print(f"Found {len(event_slugs)} event(s). Fetching sub-markets per game (one API call each)...")
+    lines_tsv: list[str] = ["event_slug\tmarket_slug\tquestion\tgame_start_time"]
+    slug_only: list[str] = []
+    seen_market: set[str] = set()
+    for i, ev_slug in enumerate(event_slugs, 1):
+        if i == 1 or i % 25 == 0 or i == len(event_slugs):
+            print(f"  ... {i}/{len(event_slugs)}")
+        markets = fetch_event_markets(ev_slug)
+        for m in markets:
+            mslug = (m.get("slug") or "").strip()
+            if not mslug or mslug in seen_market:
+                continue
+            seen_market.add(mslug)
+            q = (m.get("question") or "").replace("\t", " ").replace("\n", " ")
+            gst = m.get("gameStartTime") or ""
+            lines_tsv.append(f"{ev_slug}\t{mslug}\t{q}\t{gst}")
+            slug_only.append(mslug)
+    out_tsv.write_text("\n".join(lines_tsv) + "\n", encoding="utf-8")
+    out_slugs.write_text("\n".join(slug_only) + "\n", encoding="utf-8")
+    print()
+    print(f"Wrote {len(seen_market)} market row(s) to:")
+    print(f"  {out_tsv}")
+    print(f"  {out_slugs}")
+    print()
+    print("Use each line of the .txt as the slug in /add_position <slug> <YES/NO> <price>,")
+    print("or paste into bulk_add (one '<slug> YES 0.50' line per market — set your own prices).")
 
 
 def fetch_orderbook(token_id: str) -> Optional[dict]:
@@ -500,79 +799,6 @@ def format_end_date(end_date_str) -> str:
         return "unknown"
 
 
-def is_crypto_up_down_market(question: str) -> bool:
-    """Check if market is a crypto or stock index 'Up or Down' price prediction market."""
-    q = (question or "").lower()
-    asset_keywords = [
-        "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "crypto",
-        "spx", "s&p", "sp500", "s&p 500", "nasdaq", "dow", "stock"
-    ]
-    up_down_patterns = ["up or down", "up/down", "up or down market"]
-    return any(asset in q for asset in asset_keywords) and any(pattern in q for pattern in up_down_patterns)
-
-
-def parse_time_period_from_question(question: str) -> Optional[tuple[datetime, datetime]]:
-    """
-    Parse time period from question text like:
-    'Bitcoin Up or Down - February 13, 12:00PM-12:05PM ET'
-    Returns (start_time, end_time) in UTC, or None if can't parse.
-    """
-    if not question:
-        return None
-    
-    # Look for patterns like "February 13, 12:00PM-12:05PM ET" or "Feb 13, 12:00PM-4:00PM ET"
-    # Try to extract date and time range
-    import re
-    
-    # Pattern: Month Day, HH:MMAM/PM-HH:MMAM/PM ET
-    pattern = r"([A-Za-z]+)\s+(\d{1,2}),\s+(\d{1,2}):(\d{2})(AM|PM)\s*-\s*(\d{1,2}):(\d{2})(AM|PM)\s*(ET|EST|EDT)"
-    match = re.search(pattern, question, re.IGNORECASE)
-    if not match:
-        return None
-    
-    try:
-        month_name, day, start_hour, start_min, start_ampm, end_hour, end_min, end_ampm, tz = match.groups()
-        
-        # Get current year (assume same year unless it's past December and we're in January)
-        now = datetime.now(timezone.utc)
-        year = now.year
-        
-        # Convert month name to number
-        month_map = {
-            "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
-            "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12
-        }
-        month = month_map.get(month_name.lower())
-        if not month:
-            return None
-        
-        # Convert to 24-hour format
-        start_hour_int = int(start_hour)
-        if start_ampm.upper() == "PM" and start_hour_int != 12:
-            start_hour_int += 12
-        elif start_ampm.upper() == "AM" and start_hour_int == 12:
-            start_hour_int = 0
-        
-        end_hour_int = int(end_hour)
-        if end_ampm.upper() == "PM" and end_hour_int != 12:
-            end_hour_int += 12
-        elif end_ampm.upper() == "AM" and end_hour_int == 12:
-            end_hour_int = 0
-        
-        # ET is UTC-5 (EST) or UTC-4 (EDT) - use UTC-4 for simplicity (EDT)
-        # Create naive datetime objects (assume ET timezone)
-        start_naive = datetime(year, month, int(day), start_hour_int, int(start_min))
-        end_naive = datetime(year, month, int(day), end_hour_int, int(end_min))
-        
-        # Convert ET to UTC (ET = UTC-4, so add 4 hours)
-        start_dt = (start_naive + timedelta(hours=4)).replace(tzinfo=timezone.utc)
-        end_dt = (end_naive + timedelta(hours=4)).replace(tzinfo=timezone.utc)
-        
-        return start_dt, end_dt
-    except Exception:
-        return None
-
-
 def format_reasoning(row: dict) -> str:
     """Short reasoning paragraph from available data."""
     parts = []
@@ -819,6 +1045,10 @@ def prompt_for_positions() -> list[Position]:
     """Interactively collect LP positions from the user."""
     print()
     print("Enter your LP positions (leave market slug empty to finish).")
+    print(
+        "  Tip: Press Enter at the first prompt to skip — you can add positions via "
+        "Telegram (/list_event, /add_position) once the monitor is running."
+    )
     positions: list[Position] = []
     while True:
         slug = input("  Market slug (blank to finish): ").strip()
@@ -920,6 +1150,9 @@ def get_positions_with_persistence() -> list[Position]:
                 positions.extend(extra)
         else:
             print("Discarding saved positions for this run; enter new ones.")
+            print(
+                "  (Or press Enter at the first 'Market slug' prompt to skip and use Telegram only.)"
+            )
             positions = prompt_for_positions()
     else:
         positions = prompt_for_positions()
@@ -932,7 +1165,7 @@ def get_positions_with_persistence() -> list[Position]:
 def prompt_for_telegram_bot() -> Optional[TelegramBot]:
     """Ask user for Telegram bot token and chat id."""
     print()
-    print("Telegram alerts setup (for price approaching your bids).")
+    print("Telegram alerts setup (low bid depth: USD at or above your limit).")
     token = input("  Telegram bot token (blank to disable alerts): ").strip()
     if not token:
         print("  Telegram alerts disabled.")
@@ -966,11 +1199,50 @@ def save_monitor_config(config: dict) -> None:
         print(f"Failed to save monitor config to {MONITOR_CONFIG_PATH}: {e}", file=sys.stderr)
 
 
-def get_monitor_config_with_persistence() -> tuple[Optional[TelegramBot], int, float]:
+def send_telegram_test() -> int:
+    """Send a one-off test message using monitor_config.json (no interactive prompts)."""
+    if not MONITOR_CONFIG_PATH.exists():
+        print(
+            f"Missing {MONITOR_CONFIG_PATH.name} — copy monitor_config.example.json "
+            f"and add telegram.bot_token + telegram.chat_id.",
+            file=sys.stderr,
+        )
+        return 1
+    config = load_monitor_config()
+    if not config:
+        return 1
+    tg = config.get("telegram", {}) or {}
+    token = (tg.get("bot_token") or "").strip()
+    chat_id = str(tg.get("chat_id") or "").strip()
+    if not token or not chat_id:
+        print(
+            "monitor_config.json must include telegram.bot_token and telegram.chat_id.",
+            file=sys.stderr,
+        )
+        return 1
+    bot = TelegramBot(token=token, chat_id=chat_id)
+    ok = bot.send_message(
+        "<b>LPWatch test</b>\n\n"
+        "If you see this, the bot reached your Telegram chat. "
+        "Whether your PC shows a banner depends on "
+        "<b>Telegram Desktop → Settings → Notifications</b> "
+        "and macOS <b>System Settings → Notifications → Telegram</b>.",
+        parse_mode="HTML",
+    )
+    if ok:
+        print("Test message sent. Check Telegram on this device.")
+        return 0
+    return 1
+
+
+def get_monitor_config_with_persistence() -> tuple[
+    Optional[TelegramBot], int, float, str, bool
+]:
     """
     Load saved Telegram/settings config if available, optionally override via prompts,
     and persist latest settings.
-    Returns (TelegramBot|None, poll_interval_seconds, price_alert_threshold_cents).
+    Returns (TelegramBot|None, poll_interval_seconds, min_bid_depth_usd,
+             wallet_address, sync_positions_from_wallet).
     """
     config = load_monitor_config()
     if config:
@@ -983,37 +1255,57 @@ def get_monitor_config_with_persistence() -> tuple[Optional[TelegramBot], int, f
             chat_id = str(tg_cfg.get("chat_id", "")).strip()
             bot = TelegramBot(token=token, chat_id=chat_id) if token and chat_id else None
             settings = config.get("settings", {}) or {}
-            poll_interval = int(settings.get("poll_interval_seconds", 30))
-            price_thresh = float(settings.get("price_alert_threshold_cents", 1.0))
-            return bot, poll_interval, price_thresh
+            poll_interval = int(settings.get("poll_interval_seconds", 25))
+            min_bid_depth = float(settings.get("min_bid_depth_usd", 50000.0))
+            wallet_address = str(settings.get("wallet_address", "") or "").strip()
+            sync_wallet = bool(settings.get("sync_positions_from_wallet", False))
+            return bot, poll_interval, min_bid_depth, wallet_address, sync_wallet
         else:
             print("Discarding saved monitor config for this run; enter new settings.")
 
     # Fresh prompts
     bot = prompt_for_telegram_bot()
     try:
-        poll_str = input("Poll interval seconds [default 30]: ").strip()
-        poll_interval = int(poll_str) if poll_str else 30
+        poll_str = input("Poll interval seconds [default 25]: ").strip()
+        poll_interval = int(poll_str) if poll_str else 25
     except ValueError:
-        poll_interval = 30
+        poll_interval = 25
     try:
-        thresh_str = input("Price alert threshold in cents [default 1]: ").strip()
-        price_thresh = float(thresh_str) if thresh_str else 1.0
+        depth_str = input(
+            "Min bid depth alert (USD, bids at or above your limit) [default 50000]: "
+        ).strip()
+        min_bid_depth = float(depth_str) if depth_str else 50000.0
     except ValueError:
-        price_thresh = 1.0
+        min_bid_depth = 50000.0
+
+    wallet_in = input(
+        "Polymarket wallet address (0x...) for auto-sync, or blank to skip: "
+    ).strip()
+    sync_wallet = False
+    if wallet_in:
+        sync_ans = (
+            input(
+                "Refresh positions every poll from this wallet via Data API? [y/N]: "
+            )
+            .strip()
+            .lower()
+        )
+        sync_wallet = sync_ans == "y"
 
     # Save for next time
     cfg = {
         "telegram": {},
         "settings": {
             "poll_interval_seconds": poll_interval,
-            "price_alert_threshold_cents": price_thresh,
+            "min_bid_depth_usd": min_bid_depth,
+            "wallet_address": wallet_in,
+            "sync_positions_from_wallet": sync_wallet,
         },
     }
     if bot is not None:
         cfg["telegram"] = {"bot_token": bot.token, "chat_id": bot.chat_id}
     save_monitor_config(cfg)
-    return bot, poll_interval, price_thresh
+    return bot, poll_interval, min_bid_depth, wallet_in, sync_wallet
 
 
 def process_telegram_commands(
@@ -1096,6 +1388,7 @@ def process_telegram_commands(
                                 "limit_price": p.my_limit_price,
                                 "distance_cents": None,
                                 "bids_before": None,
+                                "game_start": None,
                             }
                         )
                         continue
@@ -1132,19 +1425,15 @@ def process_telegram_commands(
                             "limit_price": p.my_limit_price,
                             "distance_cents": distance_cents,
                             "bids_before": bids_dollars_before,
+                            "game_start": parse_market_game_start_utc(market),
                         }
                     )
 
-                # Sort like terminal: smallest distance, then fewest bids_before
-                rows.sort(
-                    key=lambda r: (
-                        r["distance_cents"] if r["distance_cents"] is not None else 1e9,
-                        r["bids_before"] if r["bids_before"] is not None else 1e9,
-                    )
-                )
+                now_tg = datetime.now(timezone.utc)
+                rows.sort(key=lambda r: position_row_sort_key(r, now_tg))
 
                 # Build message chunks under Telegram limit
-                header = "<b>Current positions</b>\n(sorted by risk — closest & thinnest first):"
+                header = "<b>Current positions</b>\n(sorted by soonest game first, then distance):"
                 current_block = header
                 chunks: list[str] = []
                 for r in rows:
@@ -1181,7 +1470,7 @@ def process_telegram_commands(
                             f"Current: <b>{cp:.3f}</b> • "
                             f"Limit: <b>{lp:.3f}</b> • "
                             f"Distance: <b>{dist_str}</b> • "
-                            f"Bids before: <b>${bids:,.2f}</b>"
+                            f"Bids before: {format_bids_before_telegram_html(bids)}"
                         )
 
                     if len(current_block) + len(line) > 3500:
@@ -1242,19 +1531,16 @@ def process_telegram_commands(
                             "limit_price": p.my_limit_price,
                             "distance_cents": distance_cents,
                             "bids_before": bids_dollars_before,
+                            "game_start": parse_market_game_start_utc(market),
                         }
                     )
 
                 if not rows:
                     bot.send_message("No OUT OF RANGE positions (distance ≥ 5¢).")
                 else:
-                    rows.sort(
-                        key=lambda r: (
-                            r["distance_cents"],
-                            r["bids_before"],
-                        )
-                    )
-                    header = "<b>OUT OF RANGE positions</b>\n(distance ≥ 5¢; closest & thinnest first):"
+                    now_tg = datetime.now(timezone.utc)
+                    rows.sort(key=lambda r: position_row_sort_key(r, now_tg))
+                    header = "<b>OUT OF RANGE positions</b>\n(distance ≥ 5¢; soonest game first):"
                     current_block = header
                     chunks: list[str] = []
                     for r in rows:
@@ -1273,7 +1559,7 @@ def process_telegram_commands(
                             f"Current: <b>{cp:.3f}</b> • "
                             f"Limit: <b>{lp:.3f}</b> • "
                             f"Distance: <b>{dist_str}</b> • "
-                            f"Bids before: <b>${bids:,.2f}</b>"
+                            f"Bids before: {format_bids_before_telegram_html(bids)}"
                         )
                         if len(current_block) + len(line) > 3500:
                             chunks.append(current_block)
@@ -1332,6 +1618,7 @@ def process_telegram_commands(
                             "limit_price": p.my_limit_price,
                             "distance_cents": distance_cents,
                             "bids_before": bids_dollars_before,
+                            "game_start": parse_market_game_start_utc(market),
                         }
                     )
 
@@ -1341,12 +1628,8 @@ def process_telegram_commands(
                         "Make sure you used the slug or URL of a market you have saved."
                     )
                 else:
-                    rows.sort(
-                        key=lambda r: (
-                            r["distance_cents"],
-                            r["bids_before"],
-                        )
-                    )
+                    now_tg = datetime.now(timezone.utc)
+                    rows.sort(key=lambda r: position_row_sort_key(r, now_tg))
                     # Use the first row's question as market title
                     title = rows[0]["question"]
                     if len(title) > 120:
@@ -1354,7 +1637,7 @@ def process_telegram_commands(
                     header = (
                         "<b>Positions for market</b>\n"
                         f"{title}\n"
-                        "(sorted by risk — closest & thinnest first):"
+                        "(sorted by soonest game first):"
                     )
                     current_block = header
                     chunks: list[str] = []
@@ -1381,7 +1664,7 @@ def process_telegram_commands(
                             f"Current: <b>{cp:.3f}</b> • "
                             f"Limit: <b>{lp:.3f}</b> • "
                             f"Distance: <b>{dist_str}</b> • "
-                            f"Bids before: <b>${bids:,.2f}</b>"
+                            f"Bids before: {format_bids_before_telegram_html(bids)}"
                         )
                         if len(current_block) + len(line) > 3500:
                             chunks.append(current_block)
@@ -1510,102 +1793,94 @@ def process_telegram_commands(
                 )
             bot.send_message("\n".join(msg_lines))
 
+        elif cmd in {"/list_event", "/event"}:
+            if len(parts) < 2:
+                bot.send_message("Usage: /list_event <event-slug-or-url>")
+            else:
+                raw = parts[1]
+                norm = normalize_market_slug(raw)
+                sub_markets = fetch_event_markets(norm)
+                if not sub_markets:
+                    bot.send_message(f"No sub-markets found for event: <code>{norm}</code>")
+                else:
+                    lines = [f"<b>Sub-markets for</b> <code>{norm}</code>\n"]
+                    for m in sub_markets:
+                        slug = m.get("slug") or ""
+                        question = (m.get("question") or slug)[:70]
+                        outcomes = m.get("outcomePrices") or []
+                        prices_str = ""
+                        if outcomes:
+                            try:
+                                yes_p = float(outcomes[0])
+                                no_p = float(outcomes[1]) if len(outcomes) > 1 else 1 - yes_p
+                                prices_str = f"  YES {yes_p:.0%} / NO {no_p:.0%}"
+                            except Exception:
+                                pass
+                        lines.append(f"• <b>{question}</b>{prices_str}\n  <code>{slug}</code>")
+                    lines.append("\nUse: /add_position &lt;slug&gt; &lt;YES/NO&gt; &lt;price&gt;")
+                    bot.send_message("\n".join(lines))
+
         elif cmd in {"/help", "/start"}:
             bot.send_message(
                 "Commands:\n"
                 "/positions — list current positions\n"
                 "/out_of_range — list only OUT OF RANGE positions (distance ≥ 5¢)\n"
                 "/market <slug-or-url> — show only positions for a specific market\n"
+                "/list_event <slug-or-url> — list all sub-markets for an event (moneyline, spreads, totals)\n"
                 "/add_position <slug> <YES/NO> <price> [notes]\n"
                 "/edit_position <index> <new_price> — edit price of an existing position\n"
                 "/bulk_add — add many positions; next message: one '<slug> <YES/NO> <price>' per line\n"
-                "/remove_position <index> — remove by index from /positions\n"
+                "/remove_position <index> — remove by index from /positions\n\n"
+                "While monitoring: Telegram alerts each poll when bids at/above your limit are "
+                "below $1.2M (warning band) or below min_bid_depth_usd (critical; see monitor_config.json)."
             )
 
     return last_update_id
 
 
-def check_crypto_up_down_markets(
-    bot: Optional[TelegramBot],
-    alerted_markets: set[str],
-) -> None:
-    """Check for new Up/Down markets (crypto or stock indices) starting within 1.5 hours and send Telegram alerts."""
-    if bot is None:
-        return
-    
-    try:
-        reward_markets = filter_reward_markets(fetch_all_markets())
-        now = datetime.now(timezone.utc)
-        
-        new_markets = []
-        for m in reward_markets:
-            question = m.get("question", "")
-            if not is_crypto_up_down_market(question):
-                continue
-            
-            slug = m.get("slug", "")
-            if slug in alerted_markets:
-                continue
-            
-            time_period = parse_time_period_from_question(question)
-            if not time_period:
-                continue
-            
-            start_time, end_time = time_period
-            hours_until_start = (start_time - now).total_seconds() / 3600
-            
-            # Only alert if market starts within 1.5 hours (and hasn't started yet)
-            if hours_until_start > 1.5 or hours_until_start < 0:
-                continue
-            
-            row = build_market_row(m)
-            if row:
-                new_markets.append({
-                    "slug": slug,
-                    "question": question,
-                    "start_time": start_time,
-                    "hours_until_start": hours_until_start,
-                    "daily_rewards": row["daily_rewards"],
-                    "url": row["url"],
-                })
-        
-        # Alert on new markets
-        for market in new_markets:
-            alerted_markets.add(market["slug"])
-            start_str = market["start_time"].strftime("%Y-%m-%d %H:%M UTC")
-            msg = (
-                "🚀 <b>UP/DOWN MARKET OPPORTUNITY</b>\n\n"
-                f"<b>{market['question']}</b>\n\n"
-                f"• Start: <b>{start_str}</b> ({market['hours_until_start']:.1f} hours from now)\n"
-                f"• Daily rewards: <b>${market['daily_rewards']:.2f}</b>\n"
-                f"• <b>Zero risk until market opens</b> (price cannot move when closed)\n\n"
-                f"<a href='{market['url']}'>View market</a>"
-            )
-            bot.send_message(msg)
-            print(f"  >> Alerted on Up/Down market: {market['question'][:60]}...")
-    except Exception as e:
-        print(f"  Error checking crypto Up/Down markets: {e}", file=sys.stderr)
-
-
 def run_position_monitor(
     positions: list[Position],
     bot: Optional[TelegramBot],
-    poll_interval_seconds: int = 30,
-    price_alert_threshold_cents: float = 1.0,
+    poll_interval_seconds: int = 25,
+    min_bid_depth_usd: float = 50000.0,
+    wallet_address: str = "",
+    sync_from_wallet: bool = False,
 ) -> None:
     """Continuously monitor positions and send alerts when price nears limit."""
     if not positions:
-        print("No positions to monitor.")
-        return
+        print()
+        print(
+            "No positions loaded yet — Telegram commands (/list_event, /add_position) are active."
+        )
+        print("Add positions via Telegram or restart and enter positions in the terminal.")
+        print()
 
-    last_alert_price: dict[tuple[str, str], float] = {}
     last_update_id: Optional[int] = None
-    alerted_crypto_markets: set[str] = set()
-    iteration_count = 0
     print()
     print("Starting position monitor. Ctrl+C to stop.")
+    if sync_from_wallet and wallet_address:
+        print(
+            "Wallet sync ON: positions refresh every poll from your holdings (Data API). "
+            "Selling/removing a position updates automatically. "
+            "Unfilled LP-only limit orders are not listed. "
+            "Telegram /add_position changes are overwritten on the next poll."
+        )
+    print(
+        "Game countdown (from Polymarket schedule): "
+        "green ≥7h — orange 4–7h — red <4h or GAME STARTED (exit ≥4h before tip)."
+    )
+    print(
+        "Bid depth: total USD of bids at or above your limit (includes depth at your price); "
+        f"red when below ${BIDS_BEFORE_DISPLAY_RED_USD:,.0f}; "
+        "red + ⚠ when below your min alert threshold."
+    )
     # Cache orderbooks per token_id within a single loop to avoid spamming API
     while True:
+        if sync_from_wallet and wallet_address:
+            fresh = positions_from_wallet_data_api(wallet_address)
+            positions.clear()
+            positions.extend(fresh)
+
         orderbook_cache: dict[str, Optional[dict]] = {}
         rows: list[dict] = []
         for idx, pos in enumerate(positions, 1):
@@ -1616,9 +1891,9 @@ def run_position_monitor(
             yes_price, no_price = get_current_prices(market)
             current_price = yes_price if pos.side == "YES" else no_price
             distance_cents = abs(current_price - pos.my_limit_price) * 100
-            key = (pos.market_slug, pos.side)
 
-            # Compute total dollars of bids at or above our limit on this side
+            # Total USD of bids at or above our limit (same book depth as UI "bids before";
+            # includes all size at our price level, not only queue-ahead).
             yes_token_id, no_token_id = parse_token_ids(market)
             token_id = yes_token_id if pos.side == "YES" else no_token_id
             bids_dollars_before = 0.0
@@ -1638,7 +1913,6 @@ def run_position_monitor(
                         )
                     except Exception:
                         continue
-                    # We care about bids at our price or better (>= limit)
                     if price >= pos.my_limit_price:
                         bids_dollars_before += price * size
 
@@ -1656,40 +1930,51 @@ def run_position_monitor(
                     "limit_price": pos.my_limit_price,
                     "distance_cents": distance_cents,
                     "bids_before": bids_dollars_before,
+                    "game_start": parse_market_game_start_utc(market),
                 }
             )
 
-            if distance_cents <= price_alert_threshold_cents:
-                # Avoid duplicate alerts at same price
-                if last_alert_price.get(key) == current_price:
-                    continue
-                last_alert_price[key] = current_price
-
-                direction = (
-                    "rising toward" if current_price < pos.my_limit_price else "falling toward"
-                )
+            # Telegram: bid depth — notify every poll while condition holds (no dedup).
+            # Below min: critical only. Between min and $1.2M: $1.2M warning (not both).
+            if bids_dollars_before < min_bid_depth_usd:
                 question = (market.get("question") or pos.market_slug)[:80]
                 msg = (
-                    "🚨 <b>PRICE ALERT</b>\n\n"
+                    "⚠️ <b>LOW BID DEPTH ALERT</b>\n\n"
                     f"<b>{idx}. {question}</b>\n\n"
-                    f"Price {direction} your limit on <b>{pos.side}</b>.\n"
-                    f"• Current: <b>{current_price:.3f}</b>\n"
-                    f"• Your limit: <b>{pos.my_limit_price:.3f}</b>\n"
-                    f"• Distance: <b>{distance_cents:.1f}¢</b>\n\n"
-                    f"<a href='https://polymarket.com/event/{pos.market_slug}'>View market</a>"
+                    f"Total USD of bids <b>at or above</b> your <b>{pos.side}</b> limit "
+                    f"({pos.my_limit_price:.3f}) is below <b>${min_bid_depth_usd:,.0f}</b>.\n"
+                    f"• Bids at/above limit: <b>${bids_dollars_before:,.2f}</b>\n"
+                    f"• Threshold: <b>${min_bid_depth_usd:,.0f}</b>\n\n"
+                    f"(Includes all liquidity at your price level.)\n\n"
+                    f"Consider cancelling this position.\n"
+                    f"<a href='{url}'>View market</a>"
                 )
-                print("  >> Price near your limit! Alerting.")
+                print(
+                    f"  >> Low bid depth (at/above limit)! "
+                    f"(${bids_dollars_before:,.2f} < ${min_bid_depth_usd:,.0f}) Alerting."
+                )
                 if bot is not None:
                     bot.send_message(msg)
-        # After processing all positions, print sorted by distance (closest first)
-        if rows:
-            # Sort by riskiness: smallest distance AND fewest bids before at top
-            rows.sort(
-                key=lambda r: (
-                    r["distance_cents"],
-                    r.get("bids_before", 0.0),
+            elif bids_dollars_before < BIDS_BEFORE_DISPLAY_RED_USD:
+                question = (market.get("question") or pos.market_slug)[:80]
+                msg = (
+                    "📉 <b>BID DEPTH BELOW $1.2M</b>\n\n"
+                    f"<b>{idx}. {question}</b>\n\n"
+                    f"Total USD of bids <b>at or above</b> your <b>{pos.side}</b> limit "
+                    f"({pos.my_limit_price:.3f}) is <b>below ${BIDS_BEFORE_DISPLAY_RED_USD:,.0f}</b>.\n"
+                    f"• Bids at/above limit: <b>${bids_dollars_before:,.2f}</b>\n\n"
+                    f"<a href='{url}'>View market</a>"
                 )
-            )
+                print(
+                    f"  >> Bid depth below $1.2M! (${bids_dollars_before:,.2f}) Alerting."
+                )
+                if bot is not None:
+                    bot.send_message(msg)
+
+        # After processing all positions, print sorted by soonest game first (then distance)
+        if rows:
+            now_utc = datetime.now(timezone.utc)
+            rows.sort(key=lambda r: position_row_sort_key(r, now_utc))
             print()
             for r in rows:
                 idx = r["idx"]
@@ -1708,26 +1993,24 @@ def run_position_monitor(
                 else:
                     dist_str = color_text(f"{dist:.1f}¢", GREEN)
                 title = r.get("question") or r["url"]
-                # Slightly shorten very long questions
                 if len(title) > 120:
                     title = title[:117] + "..."
                 if USE_COLOR:
                     title = color_text(title, BOLD)
+                bb = float(r.get("bids_before", 0.0))
+                bb_str = format_bids_before_terminal(bb, min_bid_depth_usd)
+                game_str = format_game_countdown_colored(r.get("game_start"), now_utc)
                 print(
                     f"{idx}. {title} — {r['side']} "
                     f"current: {r['current_price']:.3f}, "
                     f"limit: {r['limit_price']:.3f}, "
                     f"distance: {dist_str}, "
-                    f"bids before: ${r.get('bids_before', 0.0):,.2f}"
+                    f"bids before (at/above limit): {bb_str}, "
+                    f"{game_str}"
                 )
         # Handle Telegram commands (positions management)
         last_update_id = process_telegram_commands(bot, positions, last_update_id)
-        
-        # Check for crypto Up/Down markets every 10 iterations (~5 minutes)
-        iteration_count += 1
-        if iteration_count % 10 == 0:
-            check_crypto_up_down_markets(bot, alerted_crypto_markets)
-        
+
         print()
         print(f"Sleeping {poll_interval_seconds} seconds before next check...")
         try:
@@ -1738,18 +2021,27 @@ def run_position_monitor(
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("--telegram-test", "-t"):
+        sys.exit(send_telegram_test())
+
     print("Polymarket LP Rewards — Best low-risk markets")
     print()
     print("Select mode:")
     print("  [1] Scan low-risk LP markets")
-    print("  [2] Monitor my LP positions (price alerts)")
+    print("  [2] Monitor my LP positions (bid depth + terminal)")
     print("  [3] Scan markets, then monitor positions")
     print("  [4] Show my Polymarket positions by address (read-only, no private key)")
-    mode = input("Choose mode [1/2/3/4] (default 1): ").strip() or "1"
+    print("  [5] Export all active NCAA CBB market slugs (moneyline/spreads/totals → files)")
+    mode = input("Choose mode [1/2/3/4/5] (default 1): ").strip() or "1"
 
     run_scan = mode in {"1", "3"}
     run_monitor = mode in {"2", "3"}
     show_positions = mode == "4"
+    export_cbb = mode == "5"
+
+    if export_cbb:
+        export_ncaa_cbb_market_slugs()
+        return
 
     if run_scan:
         print()
@@ -1816,16 +2108,33 @@ def main():
 
     if run_monitor:
         print()
-        positions = get_positions_with_persistence()
-        if not positions:
-            print("No positions entered; skipping monitor.")
-            return
-        bot, poll_interval, price_thresh = get_monitor_config_with_persistence()
+        bot, poll_interval, min_bid_depth, wallet_address, sync_wallet = (
+            get_monitor_config_with_persistence()
+        )
+        if sync_wallet and wallet_address:
+            print()
+            print("Loading positions from Polymarket Data API (wallet holdings)...")
+            positions = positions_from_wallet_data_api(wallet_address)
+            print(f"  {len(positions)} position(s) with size > 0.")
+            if not positions:
+                print(
+                    "  Tip: unfilled LP limit orders do not appear here — "
+                    "disable wallet sync in monitor_config.json and use positions.json / Telegram."
+                )
+        else:
+            positions = get_positions_with_persistence()
+            if not positions:
+                print(
+                    "No positions in JSON yet — starting monitor anyway so Telegram works "
+                    "(/list_event, /add_position). Alerts run once you add at least one position."
+                )
         run_position_monitor(
             positions,
             bot,
             poll_interval_seconds=poll_interval,
-            price_alert_threshold_cents=price_thresh,
+            min_bid_depth_usd=min_bid_depth,
+            wallet_address=wallet_address,
+            sync_from_wallet=bool(sync_wallet and wallet_address),
         )
     elif show_positions:
         show_user_positions_read_only()

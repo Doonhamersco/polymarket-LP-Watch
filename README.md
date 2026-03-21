@@ -3,7 +3,7 @@
 LPWatch helps you farm **low-risk LP rewards** on Polymarket and avoid getting **picked off** on your bids.
 
 - **Scanner**: Finds markets with LP rewards, scores them by risk (spike, time, adverse selection), and shows the **best low-risk opportunities** with volume, liquidity, and reasoning.
-- **LP monitor**: Watches your positions and **alerts in Telegram** when price gets close to your bids, so you can pull or adjust before getting filled.
+- **LP monitor**: Watches your positions and **alerts in Telegram on every poll** while total **USD of bids at or above your limit** (same signal as “bids before”) stays below **$1.2M** (warning band) or below your **min bid depth** (default $50k, critical). Distance to limit is shown in the terminal only.
 - **Telegram commands**: Manage positions from Telegram — `/positions`, `/out_of_range`, `/add_position`, `/edit_position`, `/bulk_add`, `/remove_position`.
 
 **Note:** The script is self-contained and does not read any files at runtime. You only need `best_lp_markets.py` (and optionally the example configs) to run it. `lp.md` is optional reference documentation for the risk methodology.
@@ -22,14 +22,16 @@ LPWatch helps you farm **low-risk LP rewards** on Polymarket and avoid getting *
 
 ### LP position monitor (modes 2 & 3)
 
-- Watches your positions; alerts when **price nears your limit** (default: 1.0¢, configurable).
-- Sorts by **riskiness**: smallest distance first, then fewest **bids before** (dollars of bids at or above your limit).
-- Shows **question**, side, current, limit, distance, and **bids before** per position.
+- Watches your positions; **Telegram alerts every poll** while **bids before** (total USD at or above your limit, including size at your price) stays **below $1.2M** (warning) or **below `min_bid_depth_usd`** (default $50,000 USD, critical — you get the critical message only, not a separate $1.2M ping). Terminal still shows distance to your limit.
+- Sorts by **soonest game first** (shortest time until tip-off), then distance to limit, then **bids before**. Unknown game times and already-started games appear after upcoming games.
+- Shows **question**, side, current, limit, distance, and **bids before (at/above limit)** per position (no separate “at limit” column). In the terminal, that dollar amount is **red** when below **$1.2M**, and **red with ⚠** when below your **min bid depth** alert (default $50k). Telegram `/positions` appends ⚠️ under $1.2M.
 - Distance colors: ≤1¢ red, ≤2¢ amber, 2–4.9¢ green, **≥5¢ red + OUT OF RANGE**.
+- **Game countdown** (sports): tip-off time comes from Polymarket’s API (`gameStartTime` / event times, not web scraping). Each line ends with e.g. `6 HOURS UNTIL GAME`: **green** ≥7h before tip, **orange** 4–7h, **red** &lt;4h or after start — use red as your cue to exit ≥4h before the game.
 
 ### Telegram bot
 
 - **Positions** stored in `positions.json`; **Telegram + settings** in `monitor_config.json` (both created on first run; do not commit these).
+- **Auto-sync from wallet** (optional): set `wallet_address` to your Polymarket proxy wallet (`0x…`) and `"sync_positions_from_wallet": true` in `monitor_config.json` settings. The monitor then **reloads positions every poll** from the public **Data API** (same as mode 4). When you **sell or close** a holding, it drops off the terminal on the next refresh — no manual `/remove_position`. **Caveat:** this only sees **filled** holdings (and uses **avg entry** as the reference price for depth/distance). **Unfilled LP limit orders** are not returned by the Data API; keep using `positions.json` / Telegram for those, or use Polymarket’s CLOB authenticated API (not implemented here).
 - Commands:
   - `/positions` — list all positions (same format as terminal, sorted by risk).
   - `/out_of_range` — list only positions with **distance ≥ 5¢** (quick way to update stale limits).
@@ -99,8 +101,7 @@ python3 best_lp_markets.py
 - **[2]** Monitor my LP positions (load/save positions + Telegram config, then run monitor).
 - **[3]** Scan first, then monitor.
 - **[4]** Show my on-chain Polymarket positions by address (read-only, no private key).
-
-**Note:** When monitoring positions (modes 2/3), the script automatically checks for "Up or Down" markets (crypto or stock indices like SPX) starting within 1.5 hours and sends Telegram alerts when new opportunities appear. These markets offer massive rewards ($500–$1000 daily) with zero risk until the underlying market opens.
+- **[5]** **Export all active NCAA men’s CBB markets** — paginates Polymarket’s Gamma `series_id=10470` (same league as `/sports` → `cbb` / `ncaa-cbb`), then for each game fetches every sub-market (moneyline, spreads, totals, …). Writes `cbb_markets_export.tsv` and `cbb_market_slugs.txt` next to the script so you can bulk-add positions without pasting `/list_event` per URL.
 
 On first run in mode 2 or 3 you’ll be prompted for positions (slug/URL, side, limit price) and Telegram token + chat_id; these are saved to `positions.json` and `monitor_config.json`. On later runs you can accept saved config and go straight to monitoring. See `positions.example.json` and `monitor_config.example.json` for the expected format (do not commit real tokens or private data).
 

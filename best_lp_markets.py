@@ -544,71 +544,6 @@ def fetch_orderbook(token_id: str) -> Optional[dict]:
         return None
 
 
-def show_user_positions_read_only() -> None:
-    """
-    Prompt for a Polymarket user/proxy wallet address and display current positions
-    from the public Data API. This is read-only and does not require a private key.
-    """
-    print()
-    print("Read-only Polymarket positions (via Data API)")
-    addr = input("Enter your Polymarket user/proxy wallet address (0x...): ").strip()
-    if not addr:
-        print("No address entered; skipping.")
-        return
-
-    print()
-    print(f"Fetching current positions for {addr} ...")
-    positions = fetch_user_positions(addr)
-    if not positions:
-        print("No open positions returned by the Data API for this address.")
-        return
-
-    print(f"Found {len(positions)} position(s).")
-    print()
-    sep = "-" * 100
-    for idx, p in enumerate(positions, 1):
-        title = p.get("title") or "(untitled market)"
-        outcome = p.get("outcome") or "N/A"
-        size = float(p.get("size", 0) or 0)
-        avg_price = float(p.get("avgPrice", 0) or 0)
-        cur_price = float(p.get("curPrice", 0) or 0)
-        cash_pnl = float(p.get("cashPnl", 0) or 0)
-        pct_pnl = float(p.get("percentPnl", 0) or 0)
-        slug = p.get("slug") or ""
-        event_slug = p.get("eventSlug") or ""
-        if event_slug and slug:
-            url = f"https://polymarket.com/event/{event_slug}/{slug}"
-        elif slug:
-            url = f"https://polymarket.com/event/{slug}"
-        else:
-            url = ""
-
-        if len(title) > 120:
-            title = title[:117] + "..."
-        if USE_COLOR:
-            title_out = color_text(title, BOLD)
-        else:
-            title_out = title
-
-        print(sep)
-        print(f"{idx}. {title_out}")
-        print(
-            f"   Outcome: {outcome}  "
-            f"Size: {size:.4f}  "
-            f"Avg price: {avg_price:.4f}  "
-            f"Current price: {cur_price:.4f}"
-        )
-        print(
-            f"   PnL: ${cash_pnl:,.2f}  "
-            f"Percent PnL: {pct_pnl:.2f}%"
-        )
-        if url:
-            url_str = color_text(url, CYAN) if USE_COLOR else url
-            print(f"   {url_str}")
-        print()
-    print(sep)
-
-
 def filter_reward_markets(markets):
     """Keep only markets with clobRewards and rewardsDailyRate > 0."""
     return [
@@ -2030,14 +1965,12 @@ def main():
     print("  [1] Scan low-risk LP markets")
     print("  [2] Monitor my LP positions (bid depth + terminal)")
     print("  [3] Scan markets, then monitor positions")
-    print("  [4] Show my Polymarket positions by address (read-only, no private key)")
-    print("  [5] Export all active NCAA CBB market slugs (moneyline/spreads/totals → files)")
-    mode = input("Choose mode [1/2/3/4/5] (default 1): ").strip() or "1"
+    print("  [4] Export all active NCAA CBB market slugs (moneyline/spreads/totals → files)")
+    mode = input("Choose mode [1/2/3/4] (default 1): ").strip() or "1"
 
     run_scan = mode in {"1", "3"}
     run_monitor = mode in {"2", "3"}
-    show_positions = mode == "4"
-    export_cbb = mode == "5"
+    export_cbb = mode == "4"
 
     if export_cbb:
         export_ncaa_cbb_market_slugs()
@@ -2136,8 +2069,6 @@ def main():
             wallet_address=wallet_address,
             sync_from_wallet=bool(sync_wallet and wallet_address),
         )
-    elif show_positions:
-        show_user_positions_read_only()
 
 
 if __name__ == "__main__":

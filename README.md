@@ -38,7 +38,7 @@ Polymarket sports games are usually **one event** with **many markets** (moneyli
 | **Custom “critical” bid depth** | Edit **`monitor_config.json`** → `settings` → **`min_bid_depth_usd`** (USD). That’s the threshold for the **⚠ LOW BID DEPTH** Telegram alert and the **⚠** marker in the terminal when bids-at/above-limit fall below it. Default is **50,000**. You can set e.g. `25000` or `100000` without changing code. |
 | **$1.2M warning band** | The **second** alert tier (“below $1.2M”) and terminal **red** styling use a **fixed** cutoff (`BIDS_BEFORE_DISPLAY_RED_USD` = **1.2M** in `best_lp_markets.py`). Only **`min_bid_depth_usd`** is configurable in JSON. |
 | **Poll speed** | Same file: **`poll_interval_seconds`** (default **25**) — how often the monitor refreshes and can send Telegram alerts. |
-| **Bulk NCAA men’s CBB slugs** | Mode **[5]** exports all active **NCAA CBB** sub-markets (`series_id` for `ncaa-cbb`) to `cbb_markets_export.tsv` + `cbb_market_slugs.txt` for spreadsheet / scripted bulk adds — alternative to hand-copying from `/list_event` per URL. |
+| **Bulk NCAA men’s CBB slugs** | Mode **[4]** exports all active **NCAA CBB** sub-markets (`series_id` for `ncaa-cbb`) to `cbb_markets_export.tsv` + `cbb_market_slugs.txt` for spreadsheet / scripted bulk adds — alternative to hand-copying from `/list_event` per URL. |
 | **Test Telegram** | `python3 best_lp_markets.py --telegram-test` (or `-t`) — one message using saved `monitor_config.json` (checks delivery / desktop notifications). |
 
 **Wallet sync** (optional, in `monitor_config.json`): see [Telegram bot](#telegram-bot) — useful if you trade **filled** sports positions from the app; unfilled LP-only limits still need `positions.json` / Telegram.
@@ -46,7 +46,7 @@ Polymarket sports games are usually **one event** with **many markets** (moneyli
 ### Telegram bot
 
 - **Positions** stored in `positions.json`; **Telegram + settings** in `monitor_config.json` (both created on first run; do not commit these).
-- **Auto-sync from wallet** (optional): set `wallet_address` to your Polymarket proxy wallet (`0x…`) and `"sync_positions_from_wallet": true` in `monitor_config.json` settings. The monitor then **reloads positions every poll** from the public **Data API** (same as mode 4). When you **sell or close** a holding, it drops off the terminal on the next refresh — no manual `/remove_position`. **Caveat:** this only sees **filled** holdings (and uses **avg entry** as the reference price for depth/distance). **Unfilled LP limit orders** are not returned by the Data API; keep using `positions.json` / Telegram for those, or use Polymarket’s CLOB authenticated API (not implemented here).
+- **Auto-sync from wallet** (optional): set `wallet_address` to your Polymarket proxy wallet (`0x…`) and `"sync_positions_from_wallet": true` in `monitor_config.json` settings. The monitor then **reloads positions every poll** from the public **Data API**. When you **sell or close** a holding, it drops off the terminal on the next refresh — no manual `/remove_position`. **Caveat:** this only sees **filled** holdings (and uses **avg entry** as the reference price for depth/distance). **Unfilled LP limit orders** are not returned by the Data API; keep using `positions.json` / Telegram for those, or use Polymarket’s CLOB authenticated API (not implemented here).
 - Commands (commands only work while the **monitor process is running** — it polls Telegram in the same loop as bid-depth checks):
   - `/positions` — list all positions (same format as terminal, sorted by risk).
   - `/out_of_range` — list only positions with **distance ≥ 5¢** (quick way to update stale limits).
@@ -118,12 +118,11 @@ python3 best_lp_markets.py
 - **[1]** Scan low-risk LP markets only.
 - **[2]** Monitor my LP positions (load/save positions + Telegram config, then run monitor).
 - **[3]** Scan first, then monitor.
-- **[4]** Show my on-chain Polymarket positions by address (read-only, no private key).
-- **[5]** **Export all active NCAA men’s CBB markets** — paginates Polymarket’s Gamma `series_id=10470` (same league as `/sports` → `cbb` / `ncaa-cbb`), then for each game fetches every sub-market (moneyline, spreads, totals, …). Writes `cbb_markets_export.tsv` and `cbb_market_slugs.txt` next to the script so you can bulk-add positions without pasting `/list_event` per URL.
+- **[4]** **Export all active NCAA men’s CBB markets** — paginates Polymarket’s Gamma `series_id=10470` (same league as `/sports` → `cbb` / `ncaa-cbb`), then for each game fetches every sub-market (moneyline, spreads, totals, …). Writes `cbb_markets_export.tsv` and `cbb_market_slugs.txt` next to the script so you can bulk-add positions without pasting `/list_event` per URL.
 
 On first run in mode 2 or 3 you’ll be prompted for positions (slug/URL, side, limit price) and Telegram token + chat_id; these are saved to `positions.json` and `monitor_config.json`. On later runs you can accept saved config and go straight to monitoring. See `positions.example.json` and `monitor_config.example.json` for the expected format (do not commit real tokens or private data).
 
-**Tuning bid depth & polling:** After the first run, open **`monitor_config.json`** and adjust **`min_bid_depth_usd`** (critical alert threshold in USD) and **`poll_interval_seconds`** without re-running the wizard. For sports, use **`/list_event`** from Telegram (with the monitor running) to discover sub-market slugs, or mode **5** for a full NCAA CBB slug export.
+**Tuning bid depth & polling:** After the first run, open **`monitor_config.json`** and adjust **`min_bid_depth_usd`** (critical alert threshold in USD) and **`poll_interval_seconds`** without re-running the wizard. For sports, use **`/list_event`** from Telegram (with the monitor running) to discover sub-market slugs, or mode **4** for a full NCAA CBB slug export.
 
 **Example in Telegram:**
 
